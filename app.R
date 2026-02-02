@@ -1,5 +1,7 @@
 # app.R  ─────────────────────────────────────────────────────────────────
-# Route Segment Editor ➜ Ridership Allocation ➜ OD/IPF Expansion (3-step)
+# Transit Toolkit:
+# 1) Route Segment Editor ➜ Ridership Allocation ➜ OD/IPF Expansion
+# 2) Route / Direction Tools (Route matches / Nearest stop / Segments / APC)
 # -----------------------------------------------------------------------
 
 # Core packages
@@ -13,7 +15,7 @@ library(stringr)
 library(DT)
 library(writexl)
 
-# Extra pkgs used by Step 3
+# Extra pkgs
 library(tidyverse)
 library(stringi)
 library(ipfr)
@@ -21,14 +23,9 @@ library(questionr)
 library(shinythemes)
 library(shinyfullscreen)
 library(shinyjs)
+library(FNN)
 
-
-#setwd(dirname(rstudioapi::getActiveDocumentContext()$path))  # in RStudio
-
-# ── helpers from your allocation app ────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: route rename mapping
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Helper: route rename mapping ───────────────────────────────────────
 apply_route_map <- function(df, map_path) {
   if (!"route_short_name" %in% names(df)) {
     route_cols <- names(df)[tolower(names(df)) == "route"]
@@ -53,9 +50,7 @@ apply_route_map <- function(df, map_path) {
     select(-new)
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main: allocate ridership
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Main: allocate ridership (Step 2 helper) ───────────────────────────
 allocate_ridership <- function(seg_df        = NULL,
                                seg_path      = NULL,
                                times_path,
@@ -71,7 +66,7 @@ allocate_ridership <- function(seg_df        = NULL,
   library(stringr)
   library(purrr)
   
-  # ── 1) Ingest ──────────────────────────────────────────────────────
+  # 1) Ingest -----------------------------------------------------------
   SEGMENTOS <- if (!is.null(seg_df)) {
     seg_df
   } else if (!is.null(seg2_path) && file.exists(seg2_path)) {
@@ -98,7 +93,7 @@ allocate_ridership <- function(seg_df        = NULL,
   
   TIMES <- read_xlsx(times_path, sheet = times_sheet, .name_repair = "unique")
   
-  # ── 2) TOD percentages ─────────────────────────────────────────────
+  # 2) TOD percentages --------------------------------------------------
   time_period_cols <- TIMES %>%
     dplyr::select(-1, -2, -dplyr::last_col()) %>% names()
   
@@ -114,7 +109,7 @@ allocate_ridership <- function(seg_df        = NULL,
       across(all_of(time_period_cols), ~ .x / Total, .names = "{.col}_pct")
     )
   
-  # ── 3) Parse LINE & DIRECTION ──────────────────────────────────────
+  # 3) Parse LINE & DIRECTION -------------------------------------------
   data1 <- SEGMENTOS %>%
     mutate(
       temp      = str_split(ETC_ROUTE_ID, "_"),
@@ -128,7 +123,7 @@ allocate_ridership <- function(seg_df        = NULL,
       as.character
     ))
   
-  # ── 4) TIMES + direction mapping ───────────────────────────────────
+  # 4) TIMES + direction mapping ----------------------------------------
   line_col <- names(TIMES)[1]
   dir_col  <- names(TIMES)[2]
   
@@ -139,7 +134,7 @@ allocate_ridership <- function(seg_df        = NULL,
     ) %>%
     dplyr::select(-all_of(c(line_col, dir_col)))
   
-  # ── 5) Merge & allocate ────────────────────────────────────────────
+  # 5) Merge & allocate -------------------------------------------------
   merged <- data1 %>% left_join(data2, by = c("LINE", "DIRECTION"))
   pct_cols <- names(merged)[grep("_pct$", names(merged))]
   
@@ -161,7 +156,7 @@ allocate_ridership <- function(seg_df        = NULL,
       )
   }
   
-  # ── 6) Totals ──────────────────────────────────────────────────────
+  # 6) Totals -----------------------------------------------------------
   add_totals <- function(df, by_cols, suffix) {
     for (i in seq_along(pct_cols)) {
       df <- df %>%
@@ -181,7 +176,7 @@ allocate_ridership <- function(seg_df        = NULL,
     add_totals("ETC_ROUTE", "_ROUTE") %>%
     add_totals(character(0), "_SYS_LEV")
   
-  # ── 7) Output ──────────────────────────────────────────────────────
+  # 7) Output -----------------------------------------------------------
   final <- merged %>%
     dplyr::select(ETC_ROUTE_ID, ETC_STOP_ID, SEGMENT,
                   matches("_ON$|_OFF$|^TOTAL_"))
@@ -193,9 +188,7 @@ allocate_ridership <- function(seg_df        = NULL,
   list(full = final, summary = summary_tbl)
 }
 
-
-
-# ── Step 3 processor (drop-in) ──────────────────────────────────────────
+# ── Step 3 processor (OD/IPF) ──────────────────────────────────────────
 process_data <- function(APC_DATA, OD, O2O, sampling, max_weight_factor = 60) {
   # ---- B') Harmonize OD/O2O FINAL_ROUTE_DIRECTION to match APC (e.g., "73_01") ----
   normalize_frd <- function(x) {
@@ -879,138 +872,277 @@ process_data <- function(APC_DATA, OD, O2O, sampling, max_weight_factor = 60) {
   )
 }
 
-
+# ── Global data for Route / Direction Tools (Tab 2) ────────────────────
+base2_fixed <- read_excel(
+  path = "request_20251203_actransit_tod-route-stops.xlsx",
+  sheet = 2
+)
 
 # ── UI ─────────────────────────────────────────────────────────────────
 ui <- fluidPage(useShinyjs(),
   theme = shinytheme("darkly"),
-  tags$head(tags$style(HTML("body { padding: 0 !important; }"))),
-  titlePanel("Route Segment Editor ➜ Ridership Allocation ➜ OD/IPF Expansion"),
   
-  tabsetPanel(id = "wizard", type = "pills",
-              
-              # STEP 1 ----------------------------------------------------
-              tabPanel("1) Edit Segments",
-                       sidebarLayout(
-                         sidebarPanel(
-                           fileInput("dataset_upload", "Upload Default Segments", accept = c(".xlsx", ".xls")),
-                           uiOutput("route_picker"),
-                           br(),
-                           downloadButton("download_csv", "Download edited CSV"),
-                           br(), br(),
-                           actionButton("confirm_next", "Confirm & Continue → Allocation", class = "btn-success")
+  # Global styling (dark DataTables + sidebar / navbar tweaks)
+  tags$head(
+    tags$style(HTML("
+      body { 
+        padding: 0 !important; 
+      }
+      /* DataTable styling for dark theme */
+      table.dataTable thead th {
+        background-color: #343a40 !important;
+        color: #f8f9fa !important;
+      }
+      table.dataTable tbody tr {
+        background-color: #222222 !important;
+        color: #f8f9fa !important;
+      }
+      table.dataTable.stripe tbody tr:nth-child(odd),
+      table.dataTable.hover tbody tr:hover {
+        background-color: #2b2b2b !important;
+      }
+      .dataTables_wrapper .dataTables_length label,
+      .dataTables_wrapper .dataTables_filter label,
+      .dataTables_wrapper .dataTables_info,
+      .dataTables_wrapper .dataTables_paginate {
+        color: #f8f9fa !important;
+      }
+      .dataTables_wrapper .dataTables_filter input,
+      .dataTables_wrapper .dataTables_length select {
+        background-color: #343a40 !important;
+        color: #f8f9fa !important;
+        border-color: #555555 !important;
+      }
+      table.dataTable thead input {
+        background-color: #343a40 !important;
+        color: #f8f9fa !important;
+        border-color: #555555 !important;
+      }
+    ")),
+    tags$style(HTML("
+      .navbar, .tabbable > .nav > li > a {
+        font-weight: 500;
+      }
+      .well {
+        background-color: #22252b;
+        border-color: #333842;
+      }
+      .sidebarPanel {
+        background-color: #1f2227;
+      }
+      .shiny-output-error-validation {
+        color: #ffb3b3;
+        font-weight: 600;
+      }
+    "))
+  ),
+  
+  titlePanel("Transit Toolkit — Segments • Allocation • OD/IPF • Route/Stop/APC"),
+  
+  tabsetPanel(
+    id = "main_app",
+    type = "pills",
+    
+    # ── MAIN TAB 1: Segment Editor + Allocation + OD/IPF ───────────────
+    tabPanel(
+      "1) Segment Editor + Allocation + OD/IPF",
+      
+      tabsetPanel(
+        id = "wizard",
+        type = "pills",
+        
+        # STEP 1 ---------------------------------------------------------
+        tabPanel("1) Edit Segments",
+                 sidebarLayout(
+                   sidebarPanel(
+                     fileInput("dataset_upload", "Upload Default Segments", accept = c(".xlsx", ".xls")),
+                     uiOutput("route_picker"),
+                     br(),
+                     downloadButton("download_csv", "Download edited CSV"),
+                     br(), br(),
+                     actionButton("confirm_next", "Confirm & Continue → Allocation", class = "btn-success"),
+                     br(), br(),
+                     
+                     wellPanel(
+                       htmlOutput("sel_info"),
+                       uiOutput("segment_picker"),
+                       actionButton("apply_change", "Move selected → segment", class = "btn-primary"),
+                       br(), br(), hr(),
+                       
+                       fluidRow(
+                         column(
+                           6,
+                           checkboxInput("keep_sel", "Multi-select mode (toggle by click)", TRUE)
                          ),
-                         mainPanel(
-                           fluidRow(
-                             column(6,
-                                    h4("Viewer"),
-                                    leafletOutput("viewer_map", height = 600)
-                             ),
-                             column(
-                               6,
-                               h4("Editor"),
-                               leafletOutput("editor_map", height = 600),
-                               br(),
-                               wellPanel(
-                                 htmlOutput("sel_info"),
-                                 uiOutput("segment_picker"),
-                                 actionButton("apply_change", "Move selected → segment", class = "btn-primary"),
-                                 br(), br(), hr(),
-                                 
-                                 fluidRow(
-                                   column(
-                                     6,
-                                     checkboxInput("keep_sel", "Multi-select mode (toggle by click)", TRUE)
-                                   ),
-                                   column(
-                                     6,
-                                     actionButton("clear_sel", "Clear selection")
-                                   )
-                                 ),
-                                 actionButton("select_view", "Select all in current view")
-                               )
-                             )
+                         column(
+                           6,
+                           actionButton("clear_sel", "Clear selection")
+                         )
+                       ),
+                       actionButton("select_view", "Select all in current view")
+                     )
+                   ),
+                   mainPanel(
+                     fluidRow(
+                       column(6,
+                              h4("Viewer"),
+                              leafletOutput("viewer_map", height = 600)
+                       ),
+                       column(
+                         6,
+                         h4("Editor"),
+                         leafletOutput("editor_map", height = 600)
+                       )
+                     )
+                   )
+                 )
+        ),
+        
+        # STEP 2 ---------------------------------------------------------
+        tabPanel("2) Allocate Ridership",
+                 sidebarLayout(
+                   sidebarPanel(
+                     helpText("Uses the edited segments from Step 1."),
+                     fileInput("times", "Upload Ridership by Time Period", accept = c(".xlsx", ".xls")),
+                     fileInput("map",   "Route Rename CSV (optional: cols old,new)", accept = ".csv"),
+                     actionButton("run_alloc", "Process & Display", class = "btn-success"),
+                     downloadButton("download_xlsx", "Download Excel")
+                   ),
+                   mainPanel(
+                     uiOutput("alloc_guard"),
+                     tabsetPanel(type = "pills",
+                                 tabPanel("Final Data",    br(), DTOutput("tbl_final")),
+                                 tabPanel("Route Summary", br(), DTOutput("tbl_summary"))
+                     )
+                   )
+                 )
+        ),
+        
+        # STEP 3 ---------------------------------------------------------
+        tabPanel("3) Expand (OD/IPF)",
+                 sidebarLayout(
+                   sidebarPanel(
+                     helpText("Uses the APC produced in Step 2 → upload OD & O2O."),
+                     fileInput("od_file",  "Upload OD (.csv/.xlsx)",  accept = c(".csv",".xls",".xlsx")),
+                     fileInput("o2o_file", "Upload O2O (.csv/.xlsx)", accept = c(".csv",".xls",".xlsx")),
+                     
+                     fluidRow(
+                       column(
+                         6,
+                         numericInput(
+                           "sampling",
+                           "Sampling value:",
+                           value = 5,
+                           min = 1
+                         )
+                       ),
+                       column(
+                         6,
+                         shinyjs::disabled(
+                           numericInput(
+                             "max_weight_factor",
+                             "Maximum Weight Factor:",
+                             value = 60,
+                             min = 1
                            )
                          )
                        )
-              ),
-              
-              
-              # STEP 2 ----------------------------------------------------
-              tabPanel("2) Allocate Ridership",
-                       sidebarLayout(
-                         sidebarPanel(
-                           helpText("Uses the edited segments from Step 1."),
-                           fileInput("times", "Upload Ridership by Time Period", accept = c(".xlsx", ".xls")),
-                           fileInput("map",   "Route Rename CSV (optional: cols old,new)", accept = ".csv"),
-                           actionButton("run_alloc", "Process & Display", class = "btn-primary"),
-                           downloadButton("download_xlsx", "Download Excel")
-                         ),
-                         mainPanel(
-                           uiOutput("alloc_guard"),
-                           tabsetPanel(type = "pills",
-                                       tabPanel("Final Data",    br(), DTOutput("tbl_final")),
-                                       tabPanel("Route Summary", br(), DTOutput("tbl_summary"))
-                           )
-                         )
-                       )
-              ),
-              
-              # STEP 3 ----------------------------------------------------
-              tabPanel("3) Expand (OD/IPF)",
-                       sidebarLayout(
-                         sidebarPanel(
-                           helpText("Uses the APC produced in Step 2 → upload OD & O2O."),
-                           fileInput("od_file",  "Upload OD (.csv/.xlsx)",  accept = c(".csv",".xls",".xlsx")),
-                           fileInput("o2o_file", "Upload O2O (.csv/.xlsx)", accept = c(".csv",".xls",".xlsx")),
-                           
-                           fluidRow(
-                             column(
-                               6,
-                               numericInput(
-                                 "sampling",
-                                 "Sampling value:",
-                                 value = 5,
-                                 min = 1
-                               )
-                             ),
-                             column(
-                               6,
-                               shinyjs::disabled(
-                                 numericInput(
-                                   "max_weight_factor",
-                                   "Maximum Weight Factor:",
-                                   value = 60,
-                                   min = 1
-                                 )
-                               )
-                             )
-                           ),
-                           
-                           
-                           actionButton("run_expand", "Run Expansion", class = "btn-primary"),
-                           br(), br(),
-                           downloadButton("download_expand_xlsx", "Download Expansion Excel")
-                         ),
-                         mainPanel(
-                           uiOutput("expand_guard"),
-                           tabsetPanel(type = "pills",
-                                       tabPanel("Collapse (x3)",            br(), DTOutput("x3_table")),
-                                       tabPanel("OD Weights",               br(), DTOutput("weight_table")),
-                                       tabPanel("OD vs APC (DIFF2)",        br(), DTOutput("diff2_table")),
-                                       tabPanel("APC Adjusted (xxxx)",      br(), DTOutput("xxxx_table")),
-                                       tabPanel("Balance by Period",        br(), DTOutput("balance2_table"))
-                           )
-                         )
-                       )
-              )
-              
-  ) # <-- CLOSE tabsetPanel
-)   # <-- CLOSE fluidPage
+                     ),
+                     
+                     actionButton("run_expand", "Run Expansion", class = "btn-success"),
+                     br(), br(),
+                     downloadButton("download_expand_xlsx", "Download Expansion Excel")
+                   ),
+                   mainPanel(
+                     uiOutput("expand_guard"),
+                     tabsetPanel(type = "pills",
+                                 tabPanel("Collapse (x3)",       br(), DTOutput("x3_table")),
+                                 tabPanel("OD Weights",          br(), DTOutput("weight_table")),
+                                 tabPanel("OD vs APC (DIFF2)",   br(), DTOutput("diff2_table")),
+                                 tabPanel("APC Adjusted (xxxx)", br(), DTOutput("xxxx_table")),
+                                 tabPanel("Balance by Period",   br(), DTOutput("balance2_table"))
+                     )
+                   )
+                 )
+        )
+      )
+    ),
+    
+    # ── MAIN TAB 2: Route / Direction Tools (your new app) ─────────────
+    tabPanel(
+      "2) Route / Direction Tools",
+      
+      br(),
+      div(
+        style = "display:flex; justify-content:space-between; align-items:center;",
+        div(
+          span("Transit Tools: ", style = "font-weight:600;"),
+          span("Route Matching • Nearest Stop • Segments • APC", style = "font-size:0.9em; color:#cccccc;")
+        )
+      ),
+      br(),
+      
+      sidebarLayout(
+        sidebarPanel(
+          width = 3,
+          uiOutput("sidebar_ui")
+        ),
+        mainPanel(
+          width = 9,
+          tabsetPanel(
+            id = "tabs",
+            type = "pills",
+            
+            tabPanel(
+              "1) Route matches",
+              br(),
+              h3("Route matches", style = "margin-top:0;"),
+              p("Preview of route_short_name + direction_id matched to ETC_ROUTE_NAME."),
+              DTOutput("qqq_table")
+            ),
+            
+            tabPanel(
+              "2) Nearest stop by LAT/LON",
+              br(),
+              h3("Nearest stop by kNN (lat/lon)", style = "margin-top:0;"),
+              p(""),
+              textOutput("latlon_selected"),
+              br(),
+              DTOutput("stops_table")
+            ),
+            
+            tabPanel(
+              "3) Segments",
+              br(),
+              h3("APC-based segments", style = "margin-top:0;"),
+              p(""),
+              h4(""),
+              DTOutput(""),
+              hr(),
+              h4("SEGMENTS (with cumulative riders and segments)"),
+              DTOutput("segmentos_table")
+            ),
+            
+            tabPanel(
+              "4) APC summary",
+              br(),
+              h3("APC summary by time period", style = "margin-top:0;"),
+              p("Aggregates boardings by route_short_name, direction_id, and time period."),
+              textOutput("apc_selected"),
+              br(),
+              uiOutput("apc_cats_ui"),
+              br(),
+              DTOutput("apc_table")
+            )
+          )
+        )
+      )
+    )
+  ) # end main_app tabsetPanel
+)
+  
 
-
-
-# ── SERVER ─────────────────────────────────────────────────────────────────
+# ── SERVER ─────────────────────────────────────────────────────────────
 server <- function(input, output, session) {
   
   `%||%` <- function(x, y) if (is.null(x) || length(x) == 0 || identical(x, "")) y else x
@@ -1020,13 +1152,13 @@ server <- function(input, output, session) {
     paste0(conditionMessage(e) %||% "<no message>", " [", cls, "]")
   }
   
-  # ===== STEP 1: EDITOR ===== -----------------------------------------------
+  # ====== STEP 1: EDITOR (Main Tab 1) =================================
   
   output$viewer_map <- renderLeaflet({ leaflet() |> addTiles() })
   output$editor_map <- renderLeaflet({ leaflet() |> addTiles() })
   
   raw_segments <- reactive({
-    req(input$dataset_upload)                      # force upload
+    req(input$dataset_upload)
     path <- input$dataset_upload$datapath
     df <- read_excel(path)
     req(all(c("ETC_ROUTE_ID","SEGMENT","stop_lat","stop_lon") %in% names(df)))
@@ -1045,7 +1177,6 @@ server <- function(input, output, session) {
     lat_rng <- range(df$stop_lat, na.rm = TRUE)
     if (any(is.infinite(c(lon_rng, lat_rng)))) return(invisible(NULL))
     
-    # If all points are the same, fitBounds won't zoom; use setView
     if (diff(lon_rng) == 0 && diff(lat_rng) == 0) {
       leafletProxy(mapId) |>
         setView(lng = lon_rng[1], lat = lat_rng[1], zoom = 15)
@@ -1059,16 +1190,13 @@ server <- function(input, output, session) {
   edited_all <- reactiveVal(NULL)
   observeEvent(raw_segments(), {
     edited_all(raw_segments() %>% mutate(row_uid = dplyr::row_number()))
-  })  # <- no ignoreInit
+  })
   
   output$route_picker <- renderUI({
     df <- edited_all(); req(df)
-    
-    # Remember current selection (if any) without making it reactive
     current <- isolate(input$route_id)
     
     if ("ETC_ROUTE_NAME" %in% names(df)) {
-      # One name per route ID (take the first non-NA name)
       route_df <- df %>%
         dplyr::filter(!is.na(ETC_ROUTE_ID)) %>%
         dplyr::group_by(ETC_ROUTE_ID) %>%
@@ -1078,7 +1206,6 @@ server <- function(input, output, session) {
         ) %>%
         dplyr::arrange(ETC_ROUTE_ID)
       
-      # Build labels like "1234_00 — Main St – Downtown"
       choice_values <- route_df$ETC_ROUTE_ID
       choice_labels <- ifelse(
         is.na(route_df$ETC_ROUTE_NAME) | route_df$ETC_ROUTE_NAME == "",
@@ -1087,12 +1214,10 @@ server <- function(input, output, session) {
       )
       
     } else {
-      # Fallback: only IDs available
       choice_values <- sort(unique(df$ETC_ROUTE_ID))
       choice_labels <- choice_values
     }
     
-    # Keep previous selection if still valid; otherwise default to first
     selected_value <- if (!is.null(current) && current %in% choice_values) {
       current
     } else {
@@ -1107,7 +1232,6 @@ server <- function(input, output, session) {
     )
   })
   
-  
   filtered_data <- reactive({
     df <- edited_all(); req(df, input$route_id)
     df %>% filter(ETC_ROUTE_ID == input$route_id)
@@ -1119,7 +1243,6 @@ server <- function(input, output, session) {
     df <- filtered_data()
     uniq <- sort(unique(df$SEGMENT))
     if (length(uniq) == 0) {
-      # harmless placeholder palette
       colorFactor(c("#999999"), levels = "NA")
     } else {
       colorFactor(rainbow(length(uniq)), uniq)
@@ -1156,19 +1279,14 @@ server <- function(input, output, session) {
         data    = df,
         lng     = ~stop_lon, lat = ~stop_lat,
         radius  = ifelse(df$row_uid %in% sel, 8, 5),
-        
-        # --- NEW BORDER COLOR LOGIC ---
         stroke  = TRUE,
-        color   = ifelse(df$row_uid %in% sel, "black", "gray40"),   # border color
-        weight  = ifelse(df$row_uid %in% sel, 3, 1),                # border thickness
-        
-        # --- KEEP YOUR ORIGINAL FILL COLORS ---
+        color   = ifelse(df$row_uid %in% sel, "black", "gray40"),
+        weight  = ifelse(df$row_uid %in% sel, 3, 1),
         fillColor = ~pal(SEGMENT),
         fillOpacity = 0.9,
-        
         layerId = ~row_uid,
         popup   = ~paste0("Stop: ", stop_name, "<br>Segment: ", SEGMENT)
-    ) |>
+      ) |>
       addLegend("bottomright", pal = pal, values = df$SEGMENT, title = "Segment", opacity = 1)
   }
   
@@ -1236,7 +1354,7 @@ server <- function(input, output, session) {
     updateTabsetPanel(session, "wizard", selected = "2) Allocate Ridership")
   })
   
-  # ===== STEP 2: ALLOCATION ===== -------------------------------------------
+  # ====== STEP 2: ALLOCATION (Main Tab 1) =============================
   output$alloc_guard <- renderUI({
     if (is.null(confirmed_segments()))
       HTML("<div style='color:#b00; font-weight:600;'>Confirm your edits in Step 1 first.</div>")
@@ -1259,7 +1377,6 @@ server <- function(input, output, session) {
     })
   })
   
-  # Filter columns for display in Step 2 (hide *_TOTAL_ON, *_TOTAL_OFF, *SYS_LEV*)
   final_display <- reactive({
     res <- processed(); req(res)
     res$full %>%
@@ -1272,16 +1389,43 @@ server <- function(input, output, session) {
       dplyr::select(-dplyr::matches("TOTAL_ON|TOTAL_OFF|SYS_LEV"))
   })
   
-  output$tbl_final <- renderDT(
-    final_display(),
-    options = list(pageLength = 25, scrollX = TRUE)
-  )
+  output$tbl_final <- DT::renderDT({
+    df <- final_display()
+    num_cols <- vapply(df, is.numeric, logical(1))
+    
+    DT::datatable(
+      df,
+      rownames = FALSE,
+      filter   = "top",
+      class    = "cell-border stripe hover compact",
+      options  = list(
+        pageLength  = 25,
+        scrollX     = TRUE,
+        autoWidth   = TRUE,
+        fixedHeader = TRUE
+      )
+    ) |>
+      DT::formatRound(which(num_cols), digits = 1)
+  })
   
-  output$tbl_summary <- renderDT(
-    summary_display(),
-    options = list(pageLength = 25, scrollX = TRUE)
-  )
-  
+  output$tbl_summary <- DT::renderDT({
+    df <- summary_display()
+    num_cols <- vapply(df, is.numeric, logical(1))
+    
+    DT::datatable(
+      df,
+      rownames = FALSE,
+      filter   = "top",
+      class    = "cell-border stripe hover compact",
+      options  = list(
+        pageLength  = 25,
+        scrollX     = TRUE,
+        autoWidth   = TRUE,
+        fixedHeader = TRUE
+      )
+    ) |>
+      DT::formatRound(which(num_cols), digits = 1)
+  })
   
   output$download_xlsx <- downloadHandler(
     filename = function() paste0("ridership_allocation_", Sys.Date(), ".xlsx"),
@@ -1291,7 +1435,7 @@ server <- function(input, output, session) {
     }
   )
   
-  # ===== STEP 3: EXPANSION (IPF) ===== --------------------------------------
+  # ====== STEP 3: EXPANSION (Main Tab 1) ==============================
   output$expand_guard <- renderUI({
     if (is.null(processed()))
       HTML("<div style='color:#b00; font-weight:600;'>Run Step 2 first to generate APC.</div>")
@@ -1305,13 +1449,9 @@ server <- function(input, output, session) {
     else stop("Unsupported file type: ", ext)
   }
   
-  
-  # Auto-update max_weight_factor based on sampling:
-  # max_weight_factor = (1 / (sampling/100)) * 3 = (100 / sampling) * 3
   observeEvent(input$sampling, {
     s <- suppressWarnings(as.numeric(input$sampling))
     if (is.na(s) || s <= 0) return()
-    
     new_max <- (100 / s) * 3
     updateNumericInput(
       session,
@@ -1319,7 +1459,6 @@ server <- function(input, output, session) {
       value = round(new_max, 2)
     )
   })
-  
   
   expand_results <- eventReactive(input$run_expand, {
     if (is.null(processed())) {
@@ -1332,7 +1471,6 @@ server <- function(input, output, session) {
     OD  <- read_any(input$od_file)
     O2O <- read_any(input$o2o_file)
     
-    # ===== B) Preflight checks =====
     check_cols <- function(df, need, name){
       miss <- setdiff(need, names(df))
       if (length(miss)) stop(name, " is missing required columns: ", paste(miss, collapse = ", "))
@@ -1350,16 +1488,12 @@ server <- function(input, output, session) {
       stop("APC_DATA must contain time-bucket columns like X1_ON/X1_OFF from Step 2.")
     }
     
-    # Normalize types early (avoids cryptic errors later)
     OD  <- OD  %>% dplyr::mutate(TIME_PERIOD = as.character(TIME_PERIOD))
     O2O <- O2O %>% dplyr::mutate(TIME_PERIOD = as.character(TIME_PERIOD))
     
-    # Optional: quick console breadcrumbs
     message(sprintf("APC cols: %d • OD rows: %d • O2O rows: %d",
                     ncol(APC), nrow(OD), nrow(O2O)))
-    # ===== end preflight =====
     
-    # ===== Big visible modal while expansion runs ======================
     showModal(
       modalDialog(
         title = NULL,
@@ -1384,7 +1518,6 @@ server <- function(input, output, session) {
       )
     )
     on.exit(removeModal(), add = TRUE)
-    # ==================================================================
     
     withProgress(
       message = "Running IPF expansion...",
@@ -1400,7 +1533,6 @@ server <- function(input, output, session) {
             max_weight_factor = input$max_weight_factor
           )
         }, error = function(e) {
-          # Show full error — uses safemsg() helper defined earlier
           calls <- utils::tail(as.character(sys.calls()), 6)
           stack <- paste0("\nCall stack (last frames):\n- ", paste(calls, collapse = "\n- "))
           msg <- paste0("Expansion error: ", safemsg(e), stack)
@@ -1411,7 +1543,6 @@ server <- function(input, output, session) {
       }
     )
   })
-  
   
   output$x3_table       <- renderDT({ req(expand_results()); expand_results()$x3 },
                                     options = list(pageLength = 25, scrollX = TRUE))
@@ -1442,10 +1573,618 @@ server <- function(input, output, session) {
       )
     }
   )
+  
+  # ====== MAIN TAB 2: Route / Direction Tools =========================
+  
+  # Dynamic sidebar for this tab
+  output$sidebar_ui <- renderUI({
+    tab <- input$tabs
+    
+    if (is.null(tab) || tab == "1) Route matches") {
+      tagList(
+        h4("Step 1: Upload APC file"),
+        fileInput(
+          "base1_file",
+          "Upload 2508FA_STP_BY_TIMEPER_ALL.xlsx",
+          accept = c(".xlsx", ".xls")
+        ),
+        numericInput("base1_sheet", "Sheet for base1", value = 1, min = 1, step = 1),
+        hr(),
+        h4("Run route matching"),
+        actionButton("run_match", "Run route matching", class = "btn-primary btn-block"),
+        br(), br(),
+        downloadButton("download_qqq", "Download route_matches.xlsx", class = "btn-success btn-block")
+      )
+      
+    } else if (tab == "2) Nearest stop by LAT/LON") {
+      tagList(
+        h4("Step 2: Nearest stop"),
+        helpText("First upload dataset on Tab 1. Then select LAT/LON and run kNN."),
+        actionButton("choose_latlon", "Select LAT/LON columns", class = "btn-default btn-block"),
+        br(),
+        actionButton("run_knn", "Run nearest stop", class = "btn-primary btn-block"),
+        br(), br(),
+        downloadButton("download_stops", "Download dataset_with_stops.xlsx", class = "btn-success btn-block")
+      )
+      
+    } else if (tab == "3) Segments") {
+      tagList(
+        h4("Step 3: Segments"),
+        helpText("Set the number of segments per route + direction (editable)."),
+        
+        numericInput("segments_default_k", "Default segments (fallback):", value = 2, min = 1, step = 1),
+        br(),
+        
+        h5("Segments per route-direction"),
+        DTOutput("segments_k_table"),
+        br(),
+        
+        actionButton("apply_k_defaults", "Fill missing K with Default", class = "btn-default btn-block"),
+        br(),
+        
+        actionButton("run_segments", "Run segmentation", class = "btn-primary btn-block"),
+        br(), br(),
+        
+        downloadButton("download_segments", "Download SEGMENTOS.xlsx", class = "btn-success btn-block")
+      )
+    }
+
+    else if (tab == "4) APC summary") {
+      tagList(
+        h4("APC summary (time of day)"),
+        helpText("Uses B1.1_with_stop from Tab 2."),
+        actionButton("configure_apc", "Select APC columns", class = "btn-default btn-block"),
+        br(), br(),
+        downloadButton("download_apc", "Download APC_SUMMARY.xlsx", class = "btn-success btn-block")
+      )
+    }
+  })
+  
+  # base1 reactive
+  base1_reactive <- reactive({
+    req(input$base1_file)
+    read_excel(
+      path  = input$base1_file$datapath,
+      sheet = input$base1_sheet
+    )
+  })
+  
+  # LAT/LON selection
+  latlon <- reactiveValues(lat = NULL, lon = NULL)
+  
+  observeEvent(input$choose_latlon, {
+    base1 <- base1_reactive()
+    req(base1)
+    
+    cols <- names(base1)
+    
+    default_lat <- if ("LAT" %in% cols) "LAT" else cols[1]
+    default_lon <- if ("LONG" %in% cols) "LONG" else cols[min(2, length(cols))]
+    
+    showModal(
+      modalDialog(
+        title = "Select latitude / longitude columns in base1",
+        selectInput("lat_col", "Latitude column", choices = cols, selected = default_lat),
+        selectInput("lon_col", "Longitude column", choices = cols, selected = default_lon),
+        footer = tagList(
+          modalButton("Cancel"),
+          actionButton("confirm_latlon", "Use these columns", class = "btn-primary")
+        )
+      )
+    )
+  })
+  
+  observeEvent(input$confirm_latlon, {
+    latlon$lat <- input$lat_col
+    latlon$lon <- input$lon_col
+    removeModal()
+  })
+  
+  output$latlon_selected <- renderText({
+    if (is.null(latlon$lat) || is.null(latlon$lon)) {
+      "LAT/LON columns not set yet."
+    } else {
+      paste0("Using latitude column: ", latlon$lat,
+             " | longitude column: ", latlon$lon)
+    }
+  })
+  
+  # TAB 2.1: QQQ route matching
+  qqq_reactive <- eventReactive(input$run_match, {
+    base1 <- base1_reactive()
+    base2 <- base2_fixed
+    
+    B1 <- base1 %>%
+      mutate(
+        direction_id = case_when(
+          DIR %in% c("EB", "NB") ~ "0",
+          DIR %in% c("SB", "WB") ~ "1",
+          TRUE ~ NA_character_
+        )
+      ) %>%
+      filter(!is.na(direction_id)) %>%
+      filter(`DAY TYPE` == "1 WEEKDAY") %>%
+      rename(route_short_name = ROUTE) %>%
+      mutate(
+        route_short_name = as.character(route_short_name),
+        direction_id     = as.numeric(direction_id)
+      ) %>%
+      select(route_short_name, direction_id) %>%
+      distinct()
+    
+    b2 <- base2 %>%
+      select(route_short_name, direction_id, ETC_ROUTE_NAME) %>%
+      distinct()
+    
+    QQQ <- B1 %>%
+      left_join(b2, by = c("route_short_name", "direction_id")) %>%
+      filter(!is.na(route_short_name))
+    
+    QQQ
+  })
+  
+  output$qqq_table <- renderDT({
+    req(qqq_reactive())
+    datatable(qqq_reactive(), options = list(pageLength = 20, scrollX = TRUE))
+  })
+  
+  output$download_qqq <- downloadHandler(
+    filename = function() "route_matches.xlsx",
+    content = function(file) {
+      req(qqq_reactive())
+      write_xlsx(qqq_reactive(), file)
+    }
+  )
+  
+  # TAB 2.2: Nearest stop via LAT/LON + FNN
+  stops_reactive <- eventReactive(input$run_knn, {
+    base1 <- base1_reactive()
+    base2 <- base2_fixed
+    
+    validate(
+      need(!is.null(latlon$lat) && !is.null(latlon$lon),
+           "Please click 'Select LAT/LON columns' and choose latitude / longitude first.")
+    )
+    
+    lat_sym <- rlang::sym(latlon$lat)
+    lon_sym <- rlang::sym(latlon$lon)
+    
+    My_coords <- base2 %>%
+      select(route_short_name, direction_id, stop_id, stop_lat, stop_lon) %>%
+      distinct()
+    
+    B1.1 <- base1 %>%
+      mutate(
+        direction_id = case_when(
+          DIR %in% c("EB", "NB") ~ "0",
+          DIR %in% c("SB", "WB") ~ "1",
+          TRUE ~ NA_character_
+        )
+      ) %>%
+      filter(!is.na(direction_id)) %>%
+      filter(`DAY TYPE` == "1 WEEKDAY") %>%
+      rename(route_short_name = ROUTE) %>%
+      mutate(
+        route_short_name = as.character(route_short_name),
+        direction_id     = as.numeric(direction_id)
+      )
+    
+    B1.1_idx <- B1.1 %>%
+      mutate(.row_id = dplyr::row_number()) %>%
+      transmute(
+        .row_id,
+        route_short_name,
+        direction_id,
+        LAT  = !!lat_sym,
+        LONG = !!lon_sym
+      )
+    
+    coords_small <- My_coords %>%
+      select(route_short_name, direction_id, stop_id, stop_lat, stop_lon)
+    
+    nearest_by_group <- B1.1_idx %>%
+      group_by(route_short_name, direction_id) %>%
+      group_modify(~ {
+        cur_route <- .y$route_short_name
+        cur_dir   <- .y$direction_id
+        
+        stops <- coords_small %>%
+          filter(
+            route_short_name == cur_route,
+            direction_id     == cur_dir
+          )
+        
+        if (nrow(stops) == 0) {
+          return(.x %>% mutate(stop_id = NA_integer_))
+        }
+        
+        nn <- FNN::get.knnx(
+          data  = as.matrix(stops[, c("stop_lat", "stop_lon")]),
+          query = as.matrix(.x[,   c("LAT",      "LONG")]),
+          k = 1
+        )
+        
+        .x %>%
+          mutate(stop_id = stops$stop_id[nn$nn.index[, 1]])
+      }) %>%
+      ungroup()
+    
+    B1.1_with_stop <- B1.1 %>%
+      mutate(.row_id = dplyr::row_number()) %>%
+      left_join(
+        nearest_by_group %>% select(.row_id, stop_id),
+        by = ".row_id"
+      ) %>%
+      select(-.row_id) %>%
+      filter(!is.na(stop_id))
+    
+    B1.1_with_stop
+  })
+  
+  output$stops_table <- renderDT({
+    req(stops_reactive())
+    datatable(stops_reactive(), options = list(pageLength = 20, scrollX = TRUE))
+  })
+  
+  output$download_stops <- downloadHandler(
+    filename = function() "dataset_with_stops.xlsx",
+    content = function(file) {
+      req(stops_reactive())
+      write_xlsx(stops_reactive(), file)
+    }
+  )
+  
+  k_by_route <- reactiveVal(NULL)
+  
+  
+  route_dir_universe <- reactive({
+    df <- stops_reactive()
+    req(df)
+    
+    df %>%
+      dplyr::distinct(route_short_name, direction_id) %>%
+      dplyr::arrange(route_short_name, direction_id)
+  })
+  
+  
+  observeEvent(route_dir_universe(), {
+    uni <- route_dir_universe()
+    defk <- as.integer(input$segments_default_k %||% 2)
+    defk <- max(1L, defk)
+    
+    cur <- k_by_route()
+    
+    if (is.null(cur)) {
+      # first time
+      k_by_route(uni %>% dplyr::mutate(k = defk))
+    } else {
+      # keep existing k where possible; add new route-dirs; drop removed ones
+      merged <- uni %>%
+        dplyr::left_join(cur, by = c("route_short_name", "direction_id")) %>%
+        dplyr::mutate(k = dplyr::coalesce(as.integer(k), defk))
+      
+      k_by_route(merged)
+    }
+  }, ignoreInit = TRUE)
+  
+  
+  output$segments_k_table <- DT::renderDT({
+    uni <- route_dir_universe()
+    tbl <- k_by_route()
+    
+    # safety
+    if (is.null(tbl)) {
+      defk <- max(1L, as.integer(input$segments_default_k %||% 2))
+      tbl <- uni %>% dplyr::mutate(k = defk)
+      k_by_route(tbl)
+    }
+    
+    DT::datatable(
+      tbl,
+      rownames = FALSE,
+      editable = list(target = "cell", disable = list(columns = c(0, 1))), # only "k" editable
+      options  = list(
+        pageLength = 10,
+        scrollX = TRUE
+      )
+    )
+  })
+  
+  observeEvent(input$segments_k_table_cell_edit, {
+    info <- input$segments_k_table_cell_edit
+    tbl  <- k_by_route()
+    req(tbl)
+    
+    i <- info$row
+    j <- info$col
+    v <- info$value
+    
+    # Only column "k" should be editable, but guard anyway
+    colname <- names(tbl)[j]
+    if (colname != "k") return()
+    
+    v_num <- suppressWarnings(as.integer(v))
+    if (is.na(v_num) || v_num < 1) v_num <- 1L
+    
+    tbl[i, "k"] <- v_num
+    k_by_route(tbl)
+  })
+  
+  
+  observeEvent(input$apply_k_defaults, {
+    tbl <- k_by_route()
+    req(tbl)
+    
+    defk <- max(1L, as.integer(input$segments_default_k %||% 2))
+    tbl <- tbl %>% dplyr::mutate(k = dplyr::coalesce(as.integer(k), defk))
+    k_by_route(tbl)
+  })
+  
+  
+  
+  
+  
+  
+  # TAB 2.3: APC_SUMMARY + y2 + SEGMENTOS
+  segments_reactive <- eventReactive(input$run_segments, {
+    
+    k_tbl <- k_by_route()
+    req(k_tbl)
+    
+    defk <- max(1L, as.integer(input$segments_default_k %||% 2))
+    
+    y2_with_k <- y2 %>%
+      dplyr::left_join(k_tbl, by = c("route_short_name", "direction_id")) %>%
+      dplyr::mutate(k = dplyr::coalesce(as.integer(k), defk))
+    
+    
+    
+    
+    k <- as.integer(input$segments_k %||% 2)
+    k <- max(1L, k)
+    step_pct <- 100 / k
+    
+    base2 <- base2_fixed
+    B1.1_with_stop <- stops_reactive()
+    
+    validate(
+      need(all(c("ON", "OFF") %in% names(B1.1_with_stop)),
+           "B1.1_with_stop must contain columns 'ON' and 'OFF'. Check base1 structure.")
+    )
+    
+    APC_SUMMARY <- B1.1_with_stop %>%
+      group_by(route_short_name, direction_id, stop_id) %>%
+      summarize(
+        Boarding  = sum(ON,  na.rm = TRUE),
+        Alighting = sum(OFF, na.rm = TRUE),
+        .groups   = "drop"
+      )
+    
+    y <- base2 %>%
+      right_join(APC_SUMMARY,
+                 by = c("route_short_name", "direction_id", "stop_id"))
+    
+    sum_missings <- y %>%
+      filter(is.na(direction_id)) %>%
+      group_by(route_short_name, direction_id) %>%
+      summarise(
+        Boarding1  = sum(Boarding,  na.rm = TRUE),
+        Alighting1 = sum(Alighting, na.rm = TRUE),
+        .groups    = "drop"
+      )
+    
+    y2 <- y %>%
+      filter(!is.na(ETC_ROUTE_NAME)) %>%
+      left_join(sum_missings,
+                by = c("route_short_name", "direction_id")) %>%
+      group_by(route_short_name, direction_id) %>%
+      mutate(n = n()) %>%
+      ungroup() %>%
+      mutate(
+        Boarding1  = Boarding1 / n,
+        Alighting1 = Alighting1 / n
+      ) %>%
+      mutate(
+        Boarding1  = ifelse(is.na(Boarding1),  0, Boarding1),
+        Alighting1 = ifelse(is.na(Alighting1), 0, Alighting1)
+      ) %>%
+      mutate(
+        Boarding  = Boarding  + Boarding1,
+        Alighting = Alighting + Alighting1
+      ) %>%
+      select(-Boarding1, -Alighting1, -n)
+    
+    
+    SEGMENTOS <- y2_with_k %>%
+      mutate(seq_fixed = as.numeric(seq_fixed)) %>%
+      arrange(route_short_name, direction_id, seq_fixed) %>%
+      group_by(route_short_name, direction_id) %>%
+      mutate(
+        TOTAL_ON  = sum(Boarding,  na.rm = TRUE),
+        TOTAL_OFF = sum(Alighting, na.rm = TRUE)
+      ) %>%
+      ungroup() %>%
+      mutate(
+        TOTAL_OFF_adjusted = ifelse(
+          TOTAL_OFF != 0,
+          (Alighting / TOTAL_OFF * TOTAL_ON),
+          0
+        ),
+        TOTAL_RIDERSHIP = Boarding + TOTAL_OFF_adjusted
+      ) %>%
+      group_by(route_short_name, direction_id) %>%
+      mutate(
+        CUMM_TOTAL      = cumsum(TOTAL_RIDERSHIP),
+        TOTAL_DIRECTOPM = sum(TOTAL_RIDERSHIP, na.rm = TRUE)
+      ) %>%
+      ungroup() %>%
+      mutate(
+        `%_OF_RIDERS` = dplyr::if_else(
+          TOTAL_DIRECTOPM > 0,
+          (CUMM_TOTAL * 100) / TOTAL_DIRECTOPM,
+          0
+        ),
+        step_pct = 100 / pmax(1L, k),
+        SEGMENT = pmin(
+          k,
+          pmax(1L, ceiling(`%_OF_RIDERS` / step_pct))
+        )
+      ) %>%
+      group_by(route_short_name, direction_id) %>%
+      mutate(SEGMENT = if_else(row_number() == 1, 1L, as.integer(SEGMENT))) %>%
+      ungroup() %>%
+      select(-step_pct)
+    
+    
+    list(
+      y2        = y2,
+      SEGMENTOS = SEGMENTOS
+    )
+  })
+  
+  output$y2_table <- renderDT({
+    req(segments_reactive())
+    datatable(segments_reactive()$y2,
+              options = list(pageLength = 20, scrollX = TRUE))
+  })
+  
+  output$segmentos_table <- renderDT({
+    req(segments_reactive())
+    datatable(segments_reactive()$SEGMENTOS,
+              options = list(pageLength = 20, scrollX = TRUE))
+  })
+  
+  output$download_segments <- downloadHandler(
+    filename = function() "SEGMENTOS.xlsx",
+    content = function(file) {
+      req(segments_reactive())
+      write_xlsx(segments_reactive()$SEGMENTOS, file)
+    }
+  )
+  
+  # TAB 2.4: APC summary (by time period)
+  apc_conf <- reactiveValues(board_col = NULL, time_col = NULL)
+  
+  observeEvent(input$configure_apc, {
+    B1.1_with_stop <- stops_reactive()
+    req(B1.1_with_stop)
+    
+    cols <- names(B1.1_with_stop)
+    
+    default_board <- if ("ON" %in% cols) "ON" else cols[1]
+    default_time  <- if ("TIME PERIOD" %in% cols) "TIME PERIOD" else cols[1]
+    
+    showModal(
+      modalDialog(
+        title = "Select APC columns",
+        selectInput(
+          "board_col",
+          "Boarding column (e.g., ON):",
+          choices  = cols,
+          selected = default_board
+        ),
+        selectInput(
+          "time_col",
+          "Time period column (e.g., TIME PERIOD):",
+          choices  = cols,
+          selected = default_time
+        ),
+        footer = tagList(
+          modalButton("Cancel"),
+          actionButton("confirm_apc_cols", "Use these columns", class = "btn-primary")
+        )
+      )
+    )
+  })
+  
+  observeEvent(input$confirm_apc_cols, {
+    apc_conf$board_col <- input$board_col
+    apc_conf$time_col  <- input$time_col
+    removeModal()
+  })
+  
+  output$apc_selected <- renderText({
+    if (is.null(apc_conf$board_col) || is.null(apc_conf$time_col)) {
+      "APC columns not set yet."
+    } else {
+      paste0(
+        "Using boarding column: ", apc_conf$board_col,
+        " | time-period column: ", apc_conf$time_col
+      )
+    }
+  })
+  
+  apc_base <- reactive({
+    B1.1_with_stop <- stops_reactive()
+    req(B1.1_with_stop)
+    
+    validate(
+      need(!is.null(apc_conf$board_col) && !is.null(apc_conf$time_col),
+           "Click 'Select APC columns' and choose boarding and time-period columns.")
+    )
+    
+    board_sym <- rlang::sym(apc_conf$board_col)
+    time_sym  <- rlang::sym(apc_conf$time_col)
+    
+    APC0 <- B1.1_with_stop %>%
+      group_by(route_short_name, direction_id, !!time_sym) %>%
+      summarise(
+        ridership = sum(!!board_sym, na.rm = TRUE),
+        .groups   = "drop"
+      ) %>%
+      tidyr::pivot_wider(
+        names_from  = !!time_sym,
+        values_from = ridership,
+        values_fill = 0
+      )
+    
+    time_cols <- setdiff(names(APC0), c("route_short_name", "direction_id"))
+    
+    list(
+      APC0      = APC0,
+      time_cols = time_cols
+    )
+  })
+  
+  output$apc_cats_ui <- renderUI({
+    base <- apc_base()
+    time_cols <- base$time_cols
+    
+    if (length(time_cols) == 0) return(NULL)
+    
+    checkboxGroupInput(
+      "apc_cats",
+      "Time periods to include in Total:",
+      choices  = time_cols,
+      selected = if (is.null(input$apc_cats)) time_cols else input$apc_cats
+    )
+  })
+  
+  apc_summary <- reactive({
+    base <- apc_base()
+    APC0      <- base$APC0
+    time_cols <- base$time_cols
+    
+    if (length(time_cols) == 0) return(APC0)
+    
+    selected <- input$apc_cats
+    if (is.null(selected)) selected <- time_cols
+    
+    APC0 %>%
+      mutate(
+        Total = rowSums(dplyr::across(all_of(selected)), na.rm = TRUE)
+      )
+  })
+  
+  output$apc_table <- renderDT({
+    req(apc_summary())
+    datatable(apc_summary(), options = list(pageLength = 20, scrollX = TRUE))
+  })
 }
 
-# ── run ──────────────────────────────────────────────────────────────────────
+# ── Run app ────────────────────────────────────────────────────────────
 shinyApp(ui, server)
+
 
 
 
